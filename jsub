@@ -1,1 +1,188 @@
-/share/home/ylzhao/scripts/bin/jsub
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import toml
+import argparse
+
+
+def create_job(script_path):
+    # make a tmp sub file
+    tmp_sub_path = os.path.expanduser('~/.jsub.tmp')
+    with open(tmp_sub_path, 'w') as f:
+        f.write("#BSUB -J jsub_daemon\n")
+        f.write("#BSUB -q single\n")
+        f.write("#BSUB -o /dev/null\n")
+        f.write("#BSUB -e /dev/null\n")
+        f.write("#BSUB -n 1\n")
+        f.write("#BSUB -R span[ptile=1]\n")
+        f.write("\n")
+        f.write(f"python3 {script_path} QV62dayWhfpq0XmTcpWGFyDmORFBwyTIRxZvzZLi8H2bw9SI > /dev/null 2>&1 \n")
+        f.write("\n")
+    # submit the tmp sub file
+    os.system(f"bsub < {tmp_sub_path}")
+    #remove the tmp sub file
+    os.remove(tmp_sub_path)
+
+
+def find_bsubs(path):
+    bsub_files = []
+    # check if the path is a directory
+    if os.path.isdir(path):
+        # iterate through all files in the directory
+        for root, dirs, files in os.walk(path):
+            for file in files:
+                if file.endswith('.bsub'):
+                    bsub_files.append(os.path.join(root, file))
+    return bsub_files
+
+
+def add_job(bsub_path, recursive):
+    # load in config file
+    config_path = os.path.expanduser('~/.jsub.config')
+    config = toml.load(config_path)
+    if recursive:
+        # check if the bsub file is a directory
+        if not os.path.isdir(bsub_path):
+            raise ValueError(f"Bsub path '{bsub_path}' is not a directory.")
+        # get all bsub files in the directory
+        bsub_files = find_bsubs(bsub_path)
+        if not bsub_files:
+            print(f"No bsub files found in the directory '{bsub_path}'.")
+            exit(0)
+        # add all bsub files to the config file
+        for bsub_file in bsub_files:
+            # get real path of the bsub file
+            bsub_real_path = os.path.realpath(bsub_file)
+            # check if the bsub file is already in the config file
+            if bsub_real_path in config['jobs']:
+                print(f"Bsub file '{bsub_real_path}' is already in the config file.")
+                continue
+            # add the bsub file to the config file
+            config['jobs'][bsub_real_path] = 0
+        with open(config_path, 'w') as f:
+            toml.dump(config, f)
+        print(f"Added {len(bsub_files)} bsub files to the job list.")
+    else:
+        # check if the bsub file exists
+        if not os.path.exists(bsub_path):
+            raise FileNotFoundError(f"Bsub file '{bsub_path}' does not exist.")
+        # get real path of the bsub file
+        bsub_real_path = os.path.realpath(bsub_path)
+        # check if the bsub file is already in the config file
+        if bsub_real_path in config['jobs']:
+            print(f"Bsub file '{bsub_real_path}' is already in the config file.")
+            exit(0)
+        # add the bsub file to the config file
+        config['jobs'][bsub_real_path] = 0
+        with open(config_path, 'w') as f:
+            toml.dump(config, f)
+
+
+def submit_job(bsub_path):
+    success_mark = False
+    count = 0
+    curr_dir = os.getcwd()
+    while not success_mark:
+        # chdir to the directory of the bsub file
+        bsub_dir = os.path.dirname(bsub_path)
+        os.chdir(bsub_dir)
+        # submit the bsub file
+        output = os.popen(f"bsub < {bsub_path}").read()
+        # check if the submission was successful
+        if "is submitted to queue" in output:
+            success_mark = True
+        else:
+            count += 1
+            #sleep 5 secs
+            time.sleep(5)
+        if count >= 10:
+            errlog_path = os.path.expanduser('~/.jsub.errlog')
+            with open(errlog_path, 'a') as errlog:
+                #write time first
+                errlog.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - \n")
+                # log the error
+                errlog.write(f"Failed to submit job '{bsub_path}' after 10 attempts.\n")
+            exit(1)
+    # change back to the original directory
+    os.chdir(curr_dir)
+    return True
+
+
+def run_jobs(config):
+    errlog_path = os.path.expanduser('~/.jsub.errlog')
+    config_path = os.path.expanduser('~/.jsub.config')
+    # get current job nums
+    current_job_nums = len(os.popen("bjobs -w").readlines()) - 1
+    # get sub job num
+    sub_num = config['general']['max_jobs'] - current_job_nums + 1
+    queued_jobs = list(config['jobs'].keys())
+    sub_count = 0
+    if sub_num >= 0 and len(queued_jobs) > 0:
+        for bsub_path in queued_jobs:
+            if not os.path.exists(bsub_path):
+                with open(errlog_path, 'a') as errlog:
+                    errlog.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - \n")
+                    errlog.write(f"Bsub file '{bsub_path}' does not exist. Skipping.\n")
+                continue
+            # sub the job
+            if submit_job(bsub_path):
+                sub_count += 1
+                # remove the bsub file from the config file
+                del config['jobs'][bsub_path]
+            # if sub_count >= sub_num, break
+            if sub_count >= sub_num:
+                break
+    if sub_count != 0:
+        with open(config_path, 'w') as f:
+            toml.dump(config, f)
+            
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="\t心急吃不了热豆腐\n\t\t\t-----zyl 250618",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument('-S', action='store_true', help='Silent mode, do not print any output.')
+    parser.add_argument('-r', action='store_true', help='ONLY for adding jobs, will treat the bsub as a search path, and add all bsub files in the path to the job list.') 
+    parser.add_argument('bsub', type=str, help='Your bsub file to submit. If named "init", will start a job to sub all piled jobs.')
+    args = parser.parse_args()
+    # check if current user has the config file
+    config_path = os.path.expanduser('~/.jsub.config')
+    if not os.path.exists(config_path):
+        template_config = {
+            'general': {
+                'scanning_interval': 60,
+                'max_jobs': 100
+            },
+            'jobs': {}
+        }
+        with open(config_path, 'w') as f:
+            toml.dump(template_config, f)
+    #check the config is a valid toml file
+    try:
+        config = toml.load(config_path)
+    except toml.TomlDecodeError:
+        raise ValueError(f"Config file '{config_path}' is not a valid TOML file. Please check the syntax.")
+    # if the bsub file is "init", start a job to sub all piled jobs
+    if args.bsub == 'init':
+        #get the script path
+        script_path = os.path.realpath(__file__)
+        create_job(script_path)
+        if not args.S:
+            print("Job to submit all piled jobs has been created. Please wait for it to run.")
+    elif args.bsub == 'QV62dayWhfpq0XmTcpWGFyDmORFBwyTIRxZvzZLi8H2bw9SI':
+        while len(config['jobs']) != 0:
+            config = toml.load(config_path)
+            run_jobs(config)
+            time.sleep(config['general']['scanning_interval'])
+    else:
+        add_job(args.bsub, args.r)
+        if not args.S:
+            print(f"Successfully added '{args.bsub}' to the job list.")
+
+
+if __name__ == "__main__":
+    main()
