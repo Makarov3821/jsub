@@ -124,48 +124,57 @@ def submit_job(bsub_path, system_type):
     count = 0
     curr_dir = os.getcwd()
     
-    # 定义提交命令和成功标志
+    # 统一准备 success_str
     if system_type == 'slurm':
-        submit_cmd = f"sbatch {bsub_path}"
         success_str = "Submitted batch job"
     else:
-        submit_cmd = f"bsub < {bsub_path}"
         success_str = "is submitted to queue"
 
     while not success_mark:
-        # chdir to the directory of the bsub file
         bsub_dir = os.path.dirname(bsub_path)
         os.chdir(bsub_dir)
         
-        # submit the bsub file
+        output = ""
+        error_msg = ""
+        
         try:
-            output = os.popen(submit_cmd).read()
-        except Exception as e:
-            output = ""
+            if system_type == 'slurm':
+                # Slurm: sbatch file
+                res = subprocess.run(["sbatch", bsub_path], capture_output=True, text=True)
+            else:
+                # LSF: bsub < file
+                # 使用 stdin 参数模拟 '<' 重定向，避免使用 shell=True
+                with open(bsub_path, 'r') as f:
+                    res = subprocess.run(["bsub"], stdin=f, capture_output=True, text=True)
             
-        # check if the submission was successful
+            output = res.stdout
+            error_msg = res.stderr
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+        # 检查输出中是否包含成功标志
         if success_str in output:
             success_mark = True
         else:
             count += 1
-            #sleep 5 secs
             time.sleep(5)
         
+        # 失败重试超过10次 (约50秒)
         if count >= 10:
             errlog_path = os.path.expanduser('~/.jsub.errlog')
             with open(errlog_path, 'a') as errlog:
-                #write time first
                 errlog.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - \n")
-                # log the error
-                errlog.write(f"Failed to submit job '{bsub_path}' after 10 attempts using {system_type}. Output: {output}\n")
+                errlog.write(f"Failed to submit job '{bsub_path}' after 10 attempts using {system_type}.\n")
+                # 记录详细的 stdout 和 stderr 以便排查
+                if output.strip(): errlog.write(f"Stdout: {output.strip()}\n")
+                if error_msg.strip(): errlog.write(f"Stderr: {error_msg.strip()}\n")
             
-            # 即使失败也要切回原目录，否则下次循环路径不对
+            # 切回目录并返回 False，不退出进程
             os.chdir(curr_dir)
-            # 这里选择不退出整个程序，而是返回False，让主循环决定
-            #return False 
-            exit(1)
+            print(f"Skipping job {bsub_path} due to submission failure.")
+            return False
             
-    # change back to the original directory
     os.chdir(curr_dir)
     return True
 
@@ -175,60 +184,66 @@ def run_jobs(config):
     config_path = os.path.expanduser('~/.jsub.config')
     system_type = config['general'].get('system', 'lsf').lower()
 
-    # get current job nums
+    # --- 1. 获取当前任务数 (全 subprocess 版) ---
+    current_job_nums = 99999 
     try:
+        # 获取用户: whoami
+        # 使用 subprocess 替代 os.popen
+        res_user = subprocess.run(["whoami"], capture_output=True, text=True)
+        user = os.environ.get('USER') or res_user.stdout.strip()
+        
         if system_type == 'slurm':
-            # Slurm: squeue -u User | wc -l (减去header行)
-            # 或者 squeue -u $USER -h | wc -l (-h hidden header)
-            # 这里使用 os.environ.get('USER') 获取用户名，或者让 squeue 自动处理
-            user = os.environ.get('USER')
-            if not user:
-                # Fallback check
-                user = os.popen("whoami").read().strip()
-            
-            # 获取行数
-            lines = os.popen(f"squeue -u {user} -h").readlines()
-            current_job_nums = len(lines)
+            # Slurm: squeue
+            res = subprocess.run(f"squeue -u {user} -h", shell=True, capture_output=True, text=True)
+            if res.returncode == 0:
+                lines = [l for l in res.stdout.split('\n') if l.strip()]
+                current_job_nums = len(lines)
         else:
             # LSF: bjobs -w
-            lines = os.popen("bjobs -w").readlines()
-            current_job_nums = len(lines) - 1 if len(lines) > 0 else 0
-            if current_job_nums < 0: current_job_nums = 0
-            
+            res = subprocess.run(["bjobs", "-w"], capture_output=True, text=True)
+            if res.returncode == 0:
+                lines = res.stdout.splitlines()
+                # LSF 有 header，所以要 -1，但要注意 lines 为空的情况
+                current_job_nums = len(lines) - 1 if len(lines) > 0 else 0
+                if current_job_nums < 0: current_job_nums = 0
+                
     except Exception as e:
-        # 如果查询失败，保守起见认为队列满了，不投递
-        current_job_nums = 99999 
+        # 查询出错保持 99999，暂停投递
+        pass
 
-    # get sub job num
-    sub_num = config['general']['max_jobs'] - current_job_nums + 1 # +1 是为了稍微贪婪一点填充
+    sub_num = config['general']['max_jobs'] - current_job_nums + 1
     
     queued_jobs = list(config['jobs'].keys())
     sub_count = 0
-    
+    fail_count = 0 # 记录本轮失败数
+
     if sub_num > 0 and len(queued_jobs) > 0:
         for bsub_path in queued_jobs:
             if not os.path.exists(bsub_path):
                 with open(errlog_path, 'a') as errlog:
                     errlog.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - \n")
                     errlog.write(f"Job file '{bsub_path}' does not exist. Skipping.\n")
-                
-                # 文件不存在，从列表删除
                 del config['jobs'][bsub_path]
                 continue
                 
-            # sub the job
+            # 调用 submit_job
             if submit_job(bsub_path, system_type):
                 sub_count += 1
-                # remove the bsub file from the config file
                 del config['jobs'][bsub_path]
+            else:
+                # 投递失败，计数 +1
+                fail_count += 1
             
-            # if sub_count >= sub_num, break
-            if sub_count >= sub_num:
+            # 无论是成功投递了 sub_num 个，还是尝试失败导致“名额”耗尽，都应适时停止
+            # 这里逻辑是：只要处理过的任务数（成功+失败）达到了配额，就休息
+            if (sub_count + fail_count) >= sub_num:
                 break
                 
     if sub_count != 0 or len(queued_jobs) != len(config['jobs']):
         with open(config_path, 'w') as f:
             toml.dump(config, f)
+            
+    return fail_count
 
 
 def main():
@@ -248,7 +263,7 @@ def main():
             'general': {
                 'system': 'lsf', # 新增 system 字段
                 'scanning_interval': 60,
-                'max_jobs': 100
+                'max_jobs': 50
             },
             'jobs': {}
         }
@@ -277,16 +292,37 @@ def main():
         if not args.S:
             print(f"Job to submit all piled jobs has been created ({system_type}). Please wait for it to run.")
     elif args.bsub == 'QV62dayWhfpq0XmTcpWGFyDmORFBwyTIRxZvzZLi8H2bw9SI':
+        # 【新增】熔断计数器
+        consecutive_fails = 0
+        MAX_TOLERANCE = 3  # 连续 3 个任务（或 3 轮扫描中只要有失败累积）就熔断
+        
         while len(config['jobs']) != 0:
-            # 重新加载 config 以获取最新的 system 或 job list
+            # 重新加载 config
             config = toml.load(config_path)
-            run_jobs(config)
+            
+            # 运行任务并获取失败数
+            fails_in_this_round = run_jobs(config)
+            
+            if fails_in_this_round > 0:
+                consecutive_fails += fails_in_this_round
+                print(f"Warning: {fails_in_this_round} jobs failed in this cycle. Total consecutive failures: {consecutive_fails}")
+            else:
+                # 如果本轮平安无事，重置计数器
+                consecutive_fails = 0
+            
+            # 熔断检查
+            if consecutive_fails >= MAX_TOLERANCE:
+                err_msg = f"CRITICAL: Jsub daemon stopped! {consecutive_fails} consecutive submission failures detected."
+                print(err_msg)
+                with open(os.path.expanduser('~/.jsub.errlog'), 'a') as f:
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {err_msg}\n")
+                exit(1)
+            
             time.sleep(config['general']['scanning_interval'])
     else:
         add_job(args.bsub, args.r)
         if not args.S:
             print(f"Successfully added '{args.bsub}' to the job list.")
-
 
 if __name__ == "__main__":
     main()
