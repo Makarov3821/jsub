@@ -7,6 +7,13 @@ import toml
 import argparse
 import subprocess
 
+
+
+#--------------------用户定义区--------------------
+SUBMIT_QUEUE = 'small'  # 提交队列名称
+#-------------------------------------------------
+
+
 # 获取当前配置的系统类型，默认为 'lsf'
 def get_system_type():
     config_path = os.path.expanduser('~/.jsub.config')
@@ -31,16 +38,16 @@ def create_job(script_path, system_type):
         
         if system_type == 'slurm':
             f.write("#SBATCH -J jsub_daemon\n")
-            f.write("#SBATCH -p single\n") # 注意：Slurm的分区名可能不同，需根据集群调整
-            f.write("#SBATCH -o {daemon_log_path}\n")
-            f.write("#SBATCH -e {daemon_log_path}\n")
+            f.write(f"#SBATCH -p {SUBMIT_QUEUE}\n") # 注意：Slurm的分区名可能不同，需根据集群调整
+            f.write(f"#SBATCH -o {daemon_log_path}\n")
+            f.write(f"#SBATCH -e {daemon_log_path}\n")
             f.write("#SBATCH -n 1\n")
             f.write("#SBATCH --ntasks-per-node=1\n")
         else: # Default to LSF
             f.write("#BSUB -J jsub_daemon\n")
-            f.write("#BSUB -q small\n")
-            f.write("#BSUB -oo {daemon_log_path}\n")
-            f.write("#BSUB -eo {daemon_log_path}\n")
+            f.write(f"#BSUB -q {SUBMIT_QUEUE}\n")
+            f.write(f"#BSUB -oo {daemon_log_path}\n")
+            f.write(f"#BSUB -eo {daemon_log_path}\n")
             f.write("#BSUB -n 2\n")
             f.write("#BSUB -R span[ptile=2]\n")
         
@@ -308,6 +315,21 @@ def main():
         create_job(script_path, system_type) # 传入 system_type
         if not args.S:
             print(f"Job to submit all piled jobs has been created ({system_type}). Please wait for it to run.")
+    elif args.bsub == 'onetime':
+        if not args.S:
+            print(f"Executing one-time submission cycle ({system_type})...")
+        
+        # 重新加载配置以确保最新
+        config = toml.load(config_path)
+        
+        # 直接调用 run_jobs 执行一次逻辑
+        # run_jobs 会自动检查 squeue/bjobs，计算余量，提交作业并保存 toml
+        fail_count = run_jobs(config)
+        
+        if not args.S:
+            # 简单的结果反馈
+            remaining_jobs = len(config['jobs'])
+            print(f"Done. Failures: {fail_count}. Remaining queued jobs: {remaining_jobs}")
     elif args.bsub == 'QV62dayWhfpq0XmTcpWGFyDmORFBwyTIRxZvzZLi8H2bw9SI':
         # 【新增】守护进程启动时的自检打印
         print(f"Daemon process started. PID: {os.getpid()}")
